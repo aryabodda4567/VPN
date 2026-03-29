@@ -13,6 +13,21 @@
 #include "consts.h"
 #include "dhcp_client.h"
 
+#define SECRET_KEY "iugfsivbhibiicbSDcbSjcbSEUIfhweuhffnfoNIORroNUERIERBIhVARHVSRnruiviverivb"
+
+/*
+ * XOR Cipher: Modifies the buffer in-place
+ * Because XOR is symmetric (A ^ B = C, and C ^ B = A)
+ */
+void encrypt_decrypt(char *buffer, int length) {
+    int key_len = strlen(SECRET_KEY);
+
+    for (int i = 0; i < length; i++) {
+
+        buffer[i] = buffer[i] ^ SECRET_KEY[i % key_len];
+    }
+}
+
 // DNS Cleanup Function
 void cleanup_and_exit(int sig) {
     printf("\nCaught signal %d (Ctrl+C). Restoring original /etc/resolv.conf...\n", sig);
@@ -78,7 +93,7 @@ int setup_udp_socket(struct sockaddr_in *server_addr) {
     return sock;
 }
 
-// UPDATED: Now handles the 0x00 Magic Byte
+// Handles the 0x00 Magic Byte AND Encryption
 void run_tunnel(int tun_fd, int udp_fd, struct sockaddr_in *server_addr) {
     char buffer[MTU + 100]; // Extra space for Magic Byte
     int nread;
@@ -86,7 +101,7 @@ void run_tunnel(int tun_fd, int udp_fd, struct sockaddr_in *server_addr) {
     fd_set readfds;
     int max_fd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
 
-    printf("VPN Client running. Capturing traffic...\n");
+    printf("VPN Client running. Capturing and Encrypting traffic...\n");
 
     while (1) {
         FD_ZERO(&readfds); FD_SET(tun_fd, &readfds); FD_SET(udp_fd, &readfds);
@@ -94,22 +109,33 @@ void run_tunnel(int tun_fd, int udp_fd, struct sockaddr_in *server_addr) {
             perror("select() failed"); break;
         }
 
-        // DIRECTION 1: Outbound (Local App -> TUN -> UDP -> Server)
+        // DIRECTION 1: Outbound (Local App -> TUN -> Encrypt -> UDP -> Server)
         if (FD_ISSET(tun_fd, &readfds)) {
             // Read raw IP packet leaving room for magic byte at buffer[0]
             nread = read(tun_fd, buffer + 1, sizeof(buffer) - 1);
             if (nread > 0) {
                 buffer[0] = 0x00; // MAGIC BYTE: DATA
+
+                // --- ENCRYPT BEFORE SENDING ---
+                encrypt_decrypt(buffer, nread + 1);
+
                 sendto(udp_fd, buffer, nread + 1, 0, (struct sockaddr *)server_addr, addr_len);
             }
         }
 
-        // DIRECTION 2: Inbound (Server -> UDP -> TUN -> Local App)
+        // DIRECTION 2: Inbound (Server -> UDP -> Decrypt -> TUN -> Local App)
         if (FD_ISSET(udp_fd, &readfds)) {
             nread = recvfrom(udp_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)server_addr, &addr_len);
-            if (nread > 1 && buffer[0] == 0x00) {
-                // Strip the magic byte and write the raw IP packet to TUN
-                write(tun_fd, buffer + 1, nread - 1);
+            if (nread > 0) {
+
+                // --- DECRYPT FIRST ---
+                encrypt_decrypt(buffer, nread);
+
+                // Now that it's decrypted, check for the magic byte
+                if (nread > 1 && buffer[0] == 0x00) {
+                    // Strip the magic byte and write the raw IP packet to TUN
+                    write(tun_fd, buffer + 1, nread - 1);
+                }
             }
         }
     }
